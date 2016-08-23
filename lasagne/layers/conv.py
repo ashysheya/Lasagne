@@ -14,6 +14,7 @@ __all__ = [
     "TransposedConv2DLayer",
     "Deconv2DLayer",
     "DilatedConv2DLayer",
+    "conv_2d_layer_separable"
 ]
 
 
@@ -932,3 +933,151 @@ class DilatedConv2DLayer(BaseConvLayer):
             output_size = self.get_output_shape_for(input.shape)[2:]
         conved = op(input.transpose(1, 0, 2, 3), self.W, output_size)
         return conved.transpose(1, 0, 2, 3)
+
+
+def conv_2d_layer_separable(incoming, num_filters_vertical, num_filters_horizontal,
+                            filter_size, stride=(1, 1), pad=0, untie_biases=False,
+                            W1=init.GlorotUniform(), W2=init.GlorotUniform(),
+                            b1=init.Constant(0.), b2=init.Constant(0.),
+                            nonlinearity=nonlinearities.rectify, flip_filters=True,
+                            convolution=T.nnet.conv2d, **kwargs):
+    """
+     Function to speed up 2D convolutional layer
+
+        Assuming that the full rank original convolutional filter bank can be decomposed
+        into a linear combination of a set of separable basis filters, each convolutional
+        layer is factored as a sequence of two regular convolutional layers but with
+        rectangular filters (first layer consists of vertical filters (dx1), second one consists
+        of horizontal filters(1xd))
+
+        Parameters
+        ----------
+        incoming : a :class:`Layer` instance or a tuple
+            The layer feeding into this layer, or the expected input shape. The
+            output of this layer should be a 4D tensor, with shape
+            ``(batch_size, num_input_channels, input_rows, input_columns)``.
+
+        num_filters_vertical : int
+            The number of learnable convolutional filters in first convolutional layer (consists of
+            vertical filters)
+
+        num_filters_horizontal : int
+            The number of learnable convolutional filters in second convolutional layer (consists of
+            horizontal filters)
+
+        filter_size : int or iterable of int
+            An integer or a 2-element tuple specifying the size of the filters.
+            If integer d, (dx1) vertical and (1xd) horizontal filters will be constucted
+            If tuple (a, b), (ax1) vertical and (1xb) horizontal filters will be constructed
+
+        stride : int or iterable of int
+            An integer or a 2-element tuple specifying the stride of the
+            convolution operation.
+
+        pad : int, iterable of int, 'full', 'same' or 'valid' (default: 0)
+            By default, the convolution is only computed where the input and the
+            filter fully overlap (a valid convolution). When ``stride=1``, this
+            yields an output that is smaller than the input by ``filter_size - 1``.
+            The `pad` argument allows you to implicitly pad the input with zeros,
+            extending the output size.
+
+            A single integer results in symmetric zero-padding of the given size on
+            all borders, a tuple of two integers allows different symmetric padding
+            per dimension.
+
+            ``'full'`` pads with one less than the filter size on both sides. This
+            is equivalent to computing the convolution wherever the input and the
+            filter overlap by at least one position.
+
+            ``'same'`` pads with half the filter size (rounded down) on both sides.
+            When ``stride=1`` this results in an output size equal to the input
+            size. Even filter size is not supported.
+
+            ``'valid'`` is an alias for ``0`` (no padding / a valid convolution).
+
+            Note that ``'full'`` and ``'same'`` can be faster than equivalent
+            integer values due to optimizations by Theano.
+
+        untie_biases : bool (default: False)
+            If ``False``, the layer will have a bias parameter for each channel,
+            which is shared across all positions in this channel. As a result, the
+            `b` attribute will be a vector (1D).
+
+            If True, the layer will have separate bias parameters for each
+            position in each channel. As a result, the `b` attribute will be a
+            3D tensor.
+
+        W1, W2 : Theano shared variable, expression, numpy array or callable
+            Initial value, expression or initializer for the weights.
+            These should be a 4D tensor with shape
+            ``(num_filters, num_input_channels, filter_rows, filter_columns)``.
+            See :func:`lasagne.utils.create_param` for more information.
+            Wieghts for first and second convolutional layers respectively.
+
+        b1, b2 : Theano shared variable, expression, numpy array, callable or ``None``
+            Initial value, expression or initializer for the biases. If set to
+            ``None``, the layer will have no biases. Otherwise, biases should be
+            a 1D array with shape ``(num_filters,)`` if `untied_biases` is set to
+            ``False``. If it is set to ``True``, its shape should be
+            ``(num_filters, output_rows, output_columns)`` instead.
+            See :func:`lasagne.utils.create_param` for more information.
+            biases for first and second convolutional layers respectively.
+
+        nonlinearity : callable or None
+            The nonlinearity that is applied to the layer activations. If None
+            is provided, the layer will be linear.
+            This nonlinearuty will be applied after second convolutional layer.
+            There will be no nonlinearity in between
+
+        flip_filters : bool (default: True)
+            Whether to flip the filters before sliding them over the input,
+            performing a convolution (this is the default), or not to flip them and
+            perform a correlation. Note that for some other convolutional layers in
+            Lasagne, flipping incurs an overhead and is disabled by default --
+            check the documentation when using learned weights from another layer.
+
+        convolution : callable
+            The convolution implementation to use. Usually it should be fine to
+            leave this at the default value.
+
+        **kwargs
+            Any additional keyword arguments are passed to the `Layer` superclass.
+    """
+
+    filter_size_list = []
+    stride_list = []
+    pad_list = []
+    if isinstance(filter_size, int):
+        filter_size_list.append((filter_size, 1))
+        filter_size_list.append((1, filter_size))
+    elif isinstance(filter_size, tuple) and len(filter_size) == 2:
+        filter_size_list.append((filter_size[0], 1))
+        filter_size_list.append((1, filter_size[1]))
+    else:
+        raise ValueError('Incorrect filter size')
+    if isinstance(stride, int):
+        stride_list.append((stride, 1))
+        stride_list.append((1, stride))
+    elif isinstance(stride, tuple) and len(stride) == 2:
+        stride_list.append((stride[0], 1))
+        stride_list.append((1, stride[1]))
+    else:
+        raise ValueError('Incorrect stride size')
+    if isinstance(pad, int):
+        pad_list.append((pad, 0))
+        pad_list.append((0, pad))
+    elif isinstance(pad, tuple) and len(pad) == 2:
+        pad_list.append((pad[0], 0))
+        pad_list.append((0, pad[1]))
+    elif pad == 'full' or pad == 'same' or pad == 'valid':
+        pad_list.append(pad)
+        pad_list.append(pad)
+    else:
+        raise ValueError('Incorrect pad')
+    hidden_layer = Conv2DLayer(incoming, num_filters_vertical, filter_size=filter_size_list[0],
+                               stride=stride_list[0], pad=pad_list[0], untie_biases=untie_biases,
+                               W=W1, b=b1, nonlinearity=None, flip_filters=flip_filters, convolution=convolution,
+                               **kwargs)
+    return Conv2DLayer(hidden_layer, num_filters_horizontal, filter_size=filter_size_list[1], stride=stride_list[1],
+                       pad=pad_list[1], untie_biases=untie_biases, W=W2, b=b2, nonlinearity=nonlinearity,
+                       flip_filters=flip_filters, convolution=convolution, **kwargs)
